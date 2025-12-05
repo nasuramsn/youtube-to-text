@@ -35,6 +35,12 @@ print(f"args[2]: {is_do_download_youtube}")
 download_dir = r"/home/ubuntu-user-2404/workspace/youtube/medias"
 output_path = os.path.join(download_dir, "transcription.txt")
 
+# モデルパス設定
+# ローカルパスを使用する場合: "/path/to/local/model"
+# HuggingFaceからダウンロードする場合: "cl-tohoku/bert-base-japanese-char"
+# または None でデフォルトを使用
+BERT_MODEL_PATH = None  # 例: "/home/ubuntu-user-2404/workspace/youtube-to-text/models/bert-base-japanese-char"
+
 # MP3ファイルの保存パス
 # audio_file = os.path.join(download_dir, "audio")
 audio_file_org = "/home/ubuntu-user-2404/workspace/youtube/medias/" + args[1]
@@ -156,13 +162,22 @@ def insert_char_to_sentence(i: int, char: str, sentence: str) -> str:
     return text
 
 
-def add_punctuation_mark(input_path: str) -> str:
+def add_punctuation_mark(input_path: str, model_path: str = None) -> str:
     # 句読点を入れる
+    # model_path: ローカルパスまたはHuggingFaceモデル名
+    #   例: "/path/to/local/model" または "cl-tohoku/bert-base-japanese-char"
+    #   デフォルト: "cl-tohoku/bert-base-japanese-char"
     thresh: float = 0.8     # このスコア以上の場合、句読点を挿入する
     i: int = 0
     punctuations: array = ["、", "。", "?"]
     chars_after_mask: int = 100
-    nlp = pipeline("fill-mask", model="cl-tohoku/bert-base-japanese-char")
+    
+    # モデルパスが指定されていない場合はデフォルトを使用
+    if model_path is None:
+        model_path = "cl-tohoku/bert-base-japanese-char"
+    
+    print(f"モデルをロード中: {model_path}")
+    nlp = pipeline("fill-mask", model=model_path)
     result = ""
 
     print(f"input_path: {input_path}")
@@ -201,16 +216,17 @@ def add_punctuation_mark(input_path: str) -> str:
     return result
 
 
-def export_result_sentence(input_path: str, output_path: str) -> bool:
+def export_result_sentence(input_path: str, output_path: str, model_path: str = None) -> bool:
     # 句読点入りの文字を出力する
+    # model_path: ローカルパスまたはHuggingFaceモデル名
     punctuation_start = time.time()
-    result_sentence: str = add_punctuation_mark(input_path)
+    result_sentence: str = add_punctuation_mark(input_path, model_path=model_path)
     with open(output_path, "a", encoding="utf-8") as file:
         file.write(result_sentence)
     punctuation_end = time.time()
     punctuation_time = punctuation_end - punctuation_start
     print(f"句読点追加時間: {punctuation_time}")
-    print(f"句読点付き文字起こし結果が {output_punctuation_path} に保存されました。")
+    print(f"句読点付き文字起こし結果が {output_path} に保存されました。")
     return True
 
 
@@ -270,4 +286,4 @@ if is_do_output_punctuation:
     output_punctuation_path: str = os.path.join(download_dir, "punctuation_mark.txt")
     if os.path.exists(output_punctuation_path):
         os.remove(output_punctuation_path)
-    result: bool = export_result_sentence(output_path, output_punctuation_path)
+    result: bool = export_result_sentence(output_path, output_punctuation_path, model_path=BERT_MODEL_PATH)
