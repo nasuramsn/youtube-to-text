@@ -9,6 +9,7 @@ import time
 import sys
 
 from transformers import pipeline
+from janome.tokenizer import Tokenizer as JanomeTokenizer
 
 # args
 # 1: YoutubeのURLの番号
@@ -145,60 +146,95 @@ def convert_audio_to_monoral(audio_file: str, model) -> array:
     return [True, data_resampled]
 
 
-def insert_char_to_sentence(i: int, char: str, sentence: str) -> str:
-    # sentenceのi文字目にcharを挿入する
-    l: array = list(sentence)
-    l.insert(i, char)
-    if char == "。":
-        l.insert(i + 1, "\n")
-    text = "".join(l)
-    return text
-
-
-def add_punctuation_mark(input_path: str) -> str:
-    # 句読点を入れる
-    thresh: float = 0.8     # このスコア以上の場合、句読点を挿入する
-    i: int = 0
-    punctuations: array = ["、", "。", "?"]
+def add_punctuation_mark_word_boundary(input_path: str) -> str:
+    """
+    句読点を単語境界にのみ挿入する改良版
+    Janomeを使用して単語境界を検出し、BERTで句読点を予測する
+    これにより「言い、ます」のような単語内への誤挿入を防ぐ
+    """
+    thresh: float = 0.5
+    punctuations = ["、", "。", "？"]
     chars_after_mask: int = 100
+    
+    print("句読点予測モデルをロードしています...")
     nlp = pipeline("fill-mask", model="cl-tohoku/bert-base-japanese-char")
+    janome = JanomeTokenizer()
     result = ""
 
     print(f"input_path: {input_path}")
-    with open(input_path) as fin:
-        for line in fin:
-            original_sentence: str = line
-            corrected_sentence: str = original_sentence
-            i = 0
-            while i < len(corrected_sentence):
-                i += 1
-                if corrected_sentence[i-1] in punctuations:
-                    continue    # 句読点が連続してくることはない
-                masked_text = insert_char_to_sentence(i, nlp.tokenizer.mask_token, corrected_sentence)
-
-                try:
-                    pre_context, post_context = masked_text.split("。")[-1].split(nlp.tokenizer.mask_token)
-                    # scoreが一番高い文
-                    res = nlp(f"{pre_context}{nlp.tokenizer.mask_token}{post_context[:chars_after_mask]}")[0]
-                    if res["token_str"] not in punctuations:
-                        continue
-                    if res["score"] < thresh:
-                        continue
-                except ValueError as ve:
-                    print('Error had orrcured')
-                    print(ve)
-                    print(i)
-                    print(masked_text)
+    with open(input_path, encoding="utf-8") as fin:
+        for line_num, line in enumerate(fin, 1):
+            original_sentence = line.strip()
+            if not original_sentence:
+                result += "\n"
+                continue
+            
+            tokens = list(janome.tokenize(original_sentence))
+            word_boundaries = []
+            pos = 0
+            for token in tokens:
+                pos += len(token.surface)
+                word_boundaries.append(pos)
+            
+            corrected_sentence = original_sentence
+            offset = 0
+            
+            for boundary in word_boundaries[:-1]:
+                adjusted_pos = boundary + offset
+                
+                if adjusted_pos >= len(corrected_sentence):
+                    break
+                if adjusted_pos > 0 and corrected_sentence[adjusted_pos - 1] in punctuations:
                     continue
-
-                # punctuation = res["token_str"] if res["token_str"] != "?" else "。" # 今回は"？"は"。"として扱う
-                punctuation = res["token_str"]
-                corrected_sentence = insert_char_to_sentence(i, punctuation, corrected_sentence)
-            print(f"original_sentence: {original_sentence}")
-            print(f"corrected_sentence: {corrected_sentence}")
-            result += corrected_sentence
+                
+                pre_context = corrected_sentence[max(0, adjusted_pos - 50):adjusted_pos]
+                post_context = corrected_sentence[adjusted_pos:adjusted_pos + chars_after_mask]
+                
+                if not pre_context or not post_context:
+                    continue
+                
+                masked_input = f"{pre_context}{nlp.tokenizer.mask_token}{post_context}"
+                
+                try:
+                    predictions = nlp(masked_input)
+                    if not predictions:
+                        continue
+                    
+                    top_pred = predictions[0]
+                    token_str = top_pred["token_str"]
+                    score = top_pred["score"]
+                    
+                    if token_str in punctuations and score >= thresh:
+                        corrected_sentence = (
+                            corrected_sentence[:adjusted_pos] + 
+                            token_str + 
+                            corrected_sentence[adjusted_pos:]
+                        )
+                        offset += 1
+                        
+                        if token_str == "。":
+                            corrected_sentence = (
+                                corrected_sentence[:adjusted_pos + 1] + 
+                                "\n" + 
+                                corrected_sentence[adjusted_pos + 1:]
+                            )
+                            offset += 1
+                            
+                except Exception as e:
+                    print(f"行 {line_num} の位置 {boundary} で予測エラー: {e}")
+                    continue
+            
+            print(f"行 {line_num}: 処理完了")
+            result += corrected_sentence + "\n"
 
     return result
+
+
+def add_punctuation_mark(input_path: str) -> str:
+    """
+    句読点を追加する（改良版: 単語境界を使用）
+    """
+    return add_punctuation_mark_word_boundary(input_path)
 
 
 def export_result_sentence(input_path: str, output_path: str) -> bool:
