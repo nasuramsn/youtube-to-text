@@ -83,3 +83,13 @@ print(result)
   - `config.json` - モデル設定
   - `pytorch_model.bin` または `model.safetensors` - モデルウェイト
   - `tokenizer.json`, `vocab.txt` など - トークナイザーファイル
+
+
+
+
+
+
+
+
+
+
