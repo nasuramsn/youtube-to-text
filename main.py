@@ -106,7 +106,6 @@ def transcription(model, output_path: str, data_resampled: array, chunk_size: in
                 fp16=True,
                 without_timestamps=True)
             chunk_transcription = result['text']
-            print(f"チャンク {i//chunk_size + 1} の文字起こしが完了しました。")
 
             # 部分的な文字起こし結果をファイルに追記
             with open(output_path, "a", encoding="utf-8") as file:
@@ -228,7 +227,6 @@ def perform_speaker_diarization(audio_file: str, num_speakers: int = None) -> li
             except Exception:
                 continue
         num_speakers = best_n
-        print(f"推定話者数: {num_speakers}")
     
     clustering = AgglomerativeClustering(n_clusters=num_speakers)
     labels = clustering.fit_predict(embeddings)
