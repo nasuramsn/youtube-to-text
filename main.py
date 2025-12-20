@@ -31,13 +31,13 @@ print(f"args: {args}")
 print(f"args[2]: {args[2]}")
 print(f"args[2]: {is_do_download_youtube}")
 
-# ダウンロードディレクトリ
-download_dir = r"/home/ubuntu-user-2404/workspace/youtube/medias"
+# ダウンロードディレクトリ（相対パスを使用して移植性を向上）
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+download_dir = os.path.join(BASE_DIR, "medias")
 output_path = os.path.join(download_dir, "transcription.txt")
 
 # MP3ファイルの保存パス
-# audio_file = os.path.join(download_dir, "audio")
-audio_file_org = "/home/ubuntu-user-2404/workspace/youtube/medias/" + args[1]
+audio_file_org = os.path.join(download_dir, args[1])
 audio_file = audio_file_org + ".mp3"
 
 # yt-dlp設定
@@ -49,7 +49,6 @@ ydl_opts = {
         'preferredcodec': 'mp3',
         'preferredquality': '192',
     }],
-    'ffmpeg_location': '/usr/bin/ffmpeg'  # ここでffmpegの場所を指定
 }
 
 
@@ -170,6 +169,7 @@ def add_punctuation_mark(input_path: str) -> str:
         for line in fin:
             original_sentence: str = line
             corrected_sentence: str = original_sentence
+            i = 0
             while i < len(corrected_sentence):
                 i += 1
                 if corrected_sentence[i-1] in punctuations:
