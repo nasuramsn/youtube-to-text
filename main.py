@@ -12,6 +12,8 @@ from transformers import pipeline
 from janome.tokenizer import Tokenizer as JanomeTokenizer
 from resemblyzer import VoiceEncoder, preprocess_wav
 from sklearn.cluster import AgglomerativeClustering
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
 # args
 # 1: YoutubeのURLの番号
@@ -20,7 +22,8 @@ from sklearn.cluster import AgglomerativeClustering
 # 4: is_do_output_to_text
 # 5: is_do_output_punctuation
 # 6: is_do_speaker_diarization (optional, default: False)
-# example: qIW9NxF34Jo True True True True True
+# 7: is_do_summarization (optional, default: False)
+# example: qIW9NxF34Jo True True True True True True
 
 args = sys.argv
 video_url_org = "https://www.youtube.com/watch?v="
@@ -31,6 +34,7 @@ is_do_download_whisper = True if args[3] == "True" else False
 is_do_output_to_text = True if args[4] == "True" else False
 is_do_output_punctuation = True if args[5] == "True" else False
 is_do_speaker_diarization = True if len(args) > 6 and args[6] == "True" else False
+is_do_summarization = True if len(args) > 7 and args[7] == "True" else False
 
 print(f"args: {args}")
 print(f"args[2]: {args[2]}")
@@ -458,6 +462,146 @@ def export_result_sentence(input_path: str, output_path: str) -> bool:
     return True
 
 
+def extract_sentences(text: str) -> list:
+    """
+    テキストを文に分割する
+    """
+    sentences = []
+    current = ""
+    for char in text:
+        current += char
+        if char in ["。", "？", "！"]:
+            sentence = current.strip()
+            if sentence and len(sentence) > 5:
+                sentences.append(sentence)
+            current = ""
+    if current.strip() and len(current.strip()) > 5:
+        sentences.append(current.strip())
+    return sentences
+
+
+def summarize_text_extractive(input_path: str, num_bullets: int = 5) -> str:
+    """
+    抽出型要約を行う（TextRankベース）
+    TF-IDFベクトルとコサイン類似度を使用して重要な文を抽出する
+    
+    Args:
+        input_path: 入力ファイルのパス
+        num_bullets: 抽出する箇条書きの数
+    
+    Returns:
+        箇条書き形式の要約
+    """
+    print("要約処理を開始します...")
+    summary_start = time.time()
+    
+    # ファイルを読み込む
+    with open(input_path, encoding="utf-8") as f:
+        text = f.read()
+    
+    # 文に分割
+    sentences = extract_sentences(text)
+    print(f"抽出された文の数: {len(sentences)}")
+    
+    if len(sentences) == 0:
+        return "要約できる文が見つかりませんでした。"
+    
+    if len(sentences) <= num_bullets:
+        # 文が少ない場合はすべて返す
+        bullets = ["・" + s for s in sentences]
+        return "\n".join(bullets)
+    
+    # Janomeでトークン化してTF-IDF用のテキストを準備
+    janome = JanomeTokenizer()
+    tokenized_sentences = []
+    for sentence in sentences:
+        tokens = janome.tokenize(sentence)
+        words = [t.surface for t in tokens if len(t.surface) > 1]
+        tokenized_sentences.append(" ".join(words))
+    
+    # TF-IDFベクトルを計算
+    try:
+        vectorizer = TfidfVectorizer()
+        tfidf_matrix = vectorizer.fit_transform(tokenized_sentences)
+    except Exception as e:
+        print(f"TF-IDF計算エラー: {e}")
+        # フォールバック: 最初のnum_bullets文を返す
+        bullets = ["・" + s for s in sentences[:num_bullets]]
+        return "\n".join(bullets)
+    
+    # 文間の類似度行列を計算
+    similarity_matrix = cosine_similarity(tfidf_matrix)
+    
+    # TextRankスコアを計算（PageRankの簡易版）
+    scores = np.zeros(len(sentences))
+    damping = 0.85
+    iterations = 30
+    
+    for _ in range(iterations):
+        new_scores = np.zeros(len(sentences))
+        for i in range(len(sentences)):
+            for j in range(len(sentences)):
+                if i != j and similarity_matrix[i][j] > 0:
+                    # 類似度で重み付けしたスコアを加算
+                    row_sum = similarity_matrix[j].sum() - similarity_matrix[j][j]
+                    if row_sum > 0:
+                        new_scores[i] += damping * (similarity_matrix[i][j] / row_sum) * scores[j]
+            new_scores[i] += (1 - damping)
+        scores = new_scores
+    
+    # スコアが高い文を選択
+    ranked_indices = np.argsort(scores)[::-1]
+    
+    # 重複を避けながら上位の文を選択
+    selected_indices = []
+    selected_sentences = []
+    for idx in ranked_indices:
+        if len(selected_indices) >= num_bullets:
+            break
+        sentence = sentences[idx]
+        # 類似した文がすでに選択されていないか確認
+        is_duplicate = False
+        for selected in selected_sentences:
+            # 簡易的な重複チェック（文字の重複率）
+            overlap = len(set(sentence) & set(selected)) / max(len(set(sentence)), 1)
+            if overlap > 0.7:
+                is_duplicate = True
+                break
+        if not is_duplicate:
+            selected_indices.append(idx)
+            selected_sentences.append(sentence)
+    
+    # 元の順序でソート
+    selected_indices.sort()
+    
+    # 箇条書き形式で出力
+    bullets = []
+    for idx in selected_indices:
+        bullets.append("・" + sentences[idx])
+    
+    summary_end = time.time()
+    print(f"要約処理時間: {summary_end - summary_start:.2f}秒")
+    
+    return "\n".join(bullets)
+
+
+def export_summary(input_path: str, output_path: str, num_bullets: int = 5) -> bool:
+    """
+    要約を生成してファイルに出力する
+    """
+    try:
+        summary = summarize_text_extractive(input_path, num_bullets)
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write("【要約】\n\n")
+            f.write(summary)
+            f.write("\n")
+        print(f"要約が {output_path} に保存されました。")
+        return True
+    except Exception as e:
+        print(f"要約処理中にエラーが発生しました: {e}")
+        return False
+
+
 # main
 print(f"is_do_download_youtube: {is_do_download_youtube}")
 if is_do_download_youtube:
@@ -553,3 +697,21 @@ if is_do_speaker_diarization:
     # 結果を出力
     result: bool = export_diarized_transcription(aligned_segments, output_diarization_path)
     print(f"話者分離付き文字起こし結果が {output_diarization_path} に保存されました。")
+
+# 要約を生成する
+print(f"is_do_summarization: {is_do_summarization}")
+if is_do_summarization:
+    output_summary_path: str = os.path.join(download_dir, "summary.txt")
+    if os.path.exists(output_summary_path):
+        os.remove(output_summary_path)
+    
+    # 句読点付きテキストがあればそれを使用、なければ元のテキストを使用
+    if is_do_output_punctuation:
+        summary_input_path = os.path.join(download_dir, "punctuation_mark.txt")
+    else:
+        summary_input_path = output_path
+    
+    if os.path.exists(summary_input_path):
+        result: bool = export_summary(summary_input_path, output_summary_path, num_bullets=5)
+    else:
+        print(f"要約の入力ファイルが見つかりません: {summary_input_path}")
