@@ -22,7 +22,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 # 4: is_do_output_to_text
 # 5: is_do_output_punctuation
 # 6: is_do_speaker_diarization (optional, default: False)
-# 7: is_do_summarization (optional, default: False)
+# 7: is_do_summarization (optional, default: False) - uses LLM for abstractive summarization
 # example: qIW9NxF34Jo True True True True True True
 
 args = sys.argv
@@ -480,117 +480,280 @@ def extract_sentences(text: str) -> list:
     return sentences
 
 
-def summarize_text_extractive(input_path: str, num_bullets: int = 5) -> str:
+# LLMモデルのグローバル変数（遅延ロード用）
+_llm_model = None
+_llm_tokenizer = None
+
+
+def load_llm_model():
     """
-    抽出型要約を行う（TextRankベース）
-    TF-IDFベクトルとコサイン類似度を使用して重要な文を抽出する
+    LLMモデルを遅延ロードする
+    初回呼び出し時にモデルをダウンロード・ロードし、以降はキャッシュを使用
+    """
+    global _llm_model, _llm_tokenizer
+    
+    if _llm_model is not None:
+        return _llm_model, _llm_tokenizer
+    
+    print("LLMモデルをロードしています（初回は時間がかかります）...")
+    load_start = time.time()
+    
+    try:
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        
+        # 日本語対応のinstruction-tunedモデルを使用
+        # ELYZA-japanese-Llama-2-7b-instruct は日本語に強いモデル
+        model_name = "elyza/ELYZA-japanese-Llama-2-7b-instruct"
+        
+        print(f"モデル: {model_name}")
+        
+        # トークナイザーをロード
+        _llm_tokenizer = AutoTokenizer.from_pretrained(model_name)
+        
+        # モデルをロード（GPUがあれば使用、なければCPU）
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"デバイス: {device}")
+        
+        if device == "cuda":
+            # GPU使用時は4bit量子化でメモリ節約
+            try:
+                from transformers import BitsAndBytesConfig
+                quantization_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_compute_dtype=torch.float16
+                )
+                _llm_model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    quantization_config=quantization_config,
+                    device_map="auto"
+                )
+            except ImportError:
+                # bitsandbytesがない場合はfloat16で読み込み
+                _llm_model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    torch_dtype=torch.float16,
+                    device_map="auto"
+                )
+        else:
+            # CPU使用時
+            _llm_model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=torch.float32,
+                low_cpu_mem_usage=True
+            )
+        
+        load_end = time.time()
+        print(f"LLMモデルのロード完了: {load_end - load_start:.2f}秒")
+        
+        return _llm_model, _llm_tokenizer
+        
+    except Exception as e:
+        print(f"LLMモデルのロード中にエラーが発生しました: {e}")
+        raise
+
+
+def split_text_into_chunks(text: str, max_chars: int = 3000) -> list:
+    """
+    テキストを文境界でチャンクに分割する
+    
+    Args:
+        text: 入力テキスト
+        max_chars: 各チャンクの最大文字数
+    
+    Returns:
+        チャンクのリスト
+    """
+    sentences = extract_sentences(text)
+    
+    chunks = []
+    current_chunk = ""
+    
+    for sentence in sentences:
+        if len(current_chunk) + len(sentence) > max_chars and current_chunk:
+            chunks.append(current_chunk.strip())
+            current_chunk = sentence
+        else:
+            current_chunk += sentence
+    
+    if current_chunk.strip():
+        chunks.append(current_chunk.strip())
+    
+    return chunks
+
+
+def summarize_chunk_with_llm(text: str, model, tokenizer) -> str:
+    """
+    LLMを使用してテキストチャンクを要約する
+    
+    Args:
+        text: 要約するテキスト
+        model: LLMモデル
+        tokenizer: トークナイザー
+    
+    Returns:
+        要約テキスト
+    """
+    import torch
+    
+    # プロンプトテンプレート（ELYZA形式）
+    prompt = f"""[INST] <<SYS>>
+あなたは日本語の要約編集者です。以下の文字起こしを読み、内容を捏造せず、重要なトピックを整理して要約してください。
+出力は必ず箇条書き形式で、各項目は「・」で始めてください。
+3〜5個の重要なポイントを抽出してください。
+固有名詞・数値・政策名は可能な限り保持してください。
+感想や意見は禁止です。
+<</SYS>>
+
+以下のテキストを要約してください：
+
+{text}
+[/INST]"""
+    
+    # トークン化
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=4096)
+    
+    # デバイスに移動
+    device = next(model.parameters()).device
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    
+    # 生成
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=512,
+            temperature=0.3,
+            do_sample=True,
+            top_p=0.9,
+            repetition_penalty=1.1,
+            pad_token_id=tokenizer.eos_token_id
+        )
+    
+    # デコード
+    generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    
+    # プロンプト部分を除去して要約部分のみ抽出
+    if "[/INST]" in generated_text:
+        summary = generated_text.split("[/INST]")[-1].strip()
+    else:
+        summary = generated_text[len(prompt):].strip()
+    
+    return summary
+
+
+def summarize_text_with_llm(input_path: str, num_sections: int = 5) -> str:
+    """
+    LLMを使用して抽象型要約を行う
+    長いテキストは階層的に要約する
     
     Args:
         input_path: 入力ファイルのパス
-        num_bullets: 抽出する箇条書きの数
+        num_sections: 出力するセクション数の目安
     
     Returns:
-        箇条書き形式の要約
+        構造化された要約
     """
-    print("要約処理を開始します...")
+    print("LLM要約処理を開始します...")
     summary_start = time.time()
     
     # ファイルを読み込む
     with open(input_path, encoding="utf-8") as f:
         text = f.read()
     
-    # 文に分割
-    sentences = extract_sentences(text)
-    print(f"抽出された文の数: {len(sentences)}")
+    if not text.strip():
+        return "要約できるテキストが見つかりませんでした。"
     
-    if len(sentences) == 0:
-        return "要約できる文が見つかりませんでした。"
+    print(f"入力テキスト長: {len(text)}文字")
     
-    if len(sentences) <= num_bullets:
-        # 文が少ない場合はすべて返す
-        bullets = ["・" + s for s in sentences]
-        return "\n".join(bullets)
+    # LLMモデルをロード
+    model, tokenizer = load_llm_model()
     
-    # Janomeでトークン化してTF-IDF用のテキストを準備
-    janome = JanomeTokenizer()
-    tokenized_sentences = []
-    for sentence in sentences:
-        tokens = janome.tokenize(sentence)
-        words = [t.surface for t in tokens if len(t.surface) > 1]
-        tokenized_sentences.append(" ".join(words))
+    # テキストをチャンクに分割
+    chunks = split_text_into_chunks(text, max_chars=3000)
+    print(f"チャンク数: {len(chunks)}")
     
-    # TF-IDFベクトルを計算
-    try:
-        vectorizer = TfidfVectorizer()
-        tfidf_matrix = vectorizer.fit_transform(tokenized_sentences)
-    except Exception as e:
-        print(f"TF-IDF計算エラー: {e}")
-        # フォールバック: 最初のnum_bullets文を返す
-        bullets = ["・" + s for s in sentences[:num_bullets]]
-        return "\n".join(bullets)
-    
-    # 文間の類似度行列を計算
-    similarity_matrix = cosine_similarity(tfidf_matrix)
-    
-    # TextRankスコアを計算（PageRankの簡易版）
-    scores = np.zeros(len(sentences))
-    damping = 0.85
-    iterations = 30
-    
-    for _ in range(iterations):
-        new_scores = np.zeros(len(sentences))
-        for i in range(len(sentences)):
-            for j in range(len(sentences)):
-                if i != j and similarity_matrix[i][j] > 0:
-                    # 類似度で重み付けしたスコアを加算
-                    row_sum = similarity_matrix[j].sum() - similarity_matrix[j][j]
-                    if row_sum > 0:
-                        new_scores[i] += damping * (similarity_matrix[i][j] / row_sum) * scores[j]
-            new_scores[i] += (1 - damping)
-        scores = new_scores
-    
-    # スコアが高い文を選択
-    ranked_indices = np.argsort(scores)[::-1]
-    
-    # 重複を避けながら上位の文を選択
-    selected_indices = []
-    selected_sentences = []
-    for idx in ranked_indices:
-        if len(selected_indices) >= num_bullets:
-            break
-        sentence = sentences[idx]
-        # 類似した文がすでに選択されていないか確認
-        is_duplicate = False
-        for selected in selected_sentences:
-            # 簡易的な重複チェック（文字の重複率）
-            overlap = len(set(sentence) & set(selected)) / max(len(set(sentence)), 1)
-            if overlap > 0.7:
-                is_duplicate = True
-                break
-        if not is_duplicate:
-            selected_indices.append(idx)
-            selected_sentences.append(sentence)
-    
-    # 元の順序でソート
-    selected_indices.sort()
-    
-    # 箇条書き形式で出力
-    bullets = []
-    for idx in selected_indices:
-        bullets.append("・" + sentences[idx])
+    if len(chunks) == 1:
+        # 短いテキストは直接要約
+        summary = summarize_chunk_with_llm(chunks[0], model, tokenizer)
+    else:
+        # 長いテキストは階層的に要約
+        # Step 1: 各チャンクを要約
+        chunk_summaries = []
+        for i, chunk in enumerate(chunks):
+            print(f"チャンク {i+1}/{len(chunks)} を要約中...")
+            chunk_summary = summarize_chunk_with_llm(chunk, model, tokenizer)
+            chunk_summaries.append(chunk_summary)
+        
+        # Step 2: チャンク要約を統合して最終要約を生成
+        combined_summaries = "\n\n".join(chunk_summaries)
+        print("最終要約を生成中...")
+        
+        # 統合用のプロンプト
+        import torch
+        
+        final_prompt = f"""[INST] <<SYS>>
+あなたは日本語の要約編集者です。以下は長い文字起こしの各部分の要約です。
+これらを統合して、全体の内容を{num_sections}つのセクションにまとめてください。
+
+出力形式：
+1. 見出し：〜
+・要点...
+・要点...
+
+2. 見出し：〜
+・要点...
+
+のように、番号付きの見出しと箇条書きで構成してください。
+内容を捏造せず、固有名詞・数値は保持してください。
+<</SYS>>
+
+以下の要約を統合してください：
+
+{combined_summaries}
+[/INST]"""
+        
+        inputs = tokenizer(final_prompt, return_tensors="pt", truncation=True, max_length=4096)
+        device = next(model.parameters()).device
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=1024,
+                temperature=0.3,
+                do_sample=True,
+                top_p=0.9,
+                repetition_penalty=1.1,
+                pad_token_id=tokenizer.eos_token_id
+            )
+        
+        generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        
+        if "[/INST]" in generated_text:
+            summary = generated_text.split("[/INST]")[-1].strip()
+        else:
+            summary = generated_text[len(final_prompt):].strip()
     
     summary_end = time.time()
-    print(f"要約処理時間: {summary_end - summary_start:.2f}秒")
+    print(f"LLM要約処理時間: {summary_end - summary_start:.2f}秒")
     
-    return "\n".join(bullets)
+    return summary
 
 
-def export_summary(input_path: str, output_path: str, num_bullets: int = 5) -> bool:
+def export_summary(input_path: str, output_path: str, num_sections: int = 5) -> bool:
     """
-    要約を生成してファイルに出力する
+    LLMを使用して要約を生成してファイルに出力する
+    
+    Args:
+        input_path: 入力ファイルのパス
+        output_path: 出力ファイルのパス
+        num_sections: 出力するセクション数の目安
+    
+    Returns:
+        成功した場合はTrue、失敗した場合はFalse
     """
     try:
-        summary = summarize_text_extractive(input_path, num_bullets)
+        summary = summarize_text_with_llm(input_path, num_sections)
         with open(output_path, "w", encoding="utf-8") as f:
             f.write("【要約】\n\n")
             f.write(summary)
@@ -712,6 +875,6 @@ if is_do_summarization:
         summary_input_path = output_path
     
     if os.path.exists(summary_input_path):
-        result: bool = export_summary(summary_input_path, output_summary_path, num_bullets=5)
+        result: bool = export_summary(summary_input_path, output_summary_path, num_sections=5)
     else:
         print(f"要約の入力ファイルが見つかりません: {summary_input_path}")
