@@ -22,7 +22,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 # 4: is_do_output_to_text
 # 5: is_do_output_punctuation
 # 6: is_do_speaker_diarization (optional, default: False)
-# 7: is_do_summarization (optional, default: False)
+# 7: is_do_summarization (optional, default: False) - uses LLM for abstractive summarization
 # example: qIW9NxF34Jo True True True True True True
 
 args = sys.argv
@@ -480,117 +480,77 @@ def extract_sentences(text: str) -> list:
     return sentences
 
 
-def summarize_text_extractive(input_path: str, num_bullets: int = 5) -> str:
+def summarize_with_gemini(text: str, num_sections: int = 5) -> str:
     """
-    抽出型要約を行う（TextRankベース）
-    TF-IDFベクトルとコサイン類似度を使用して重要な文を抽出する
+    Gemini APIを使用してテキストを要約する
+    
+    Args:
+        text: 要約するテキスト
+        num_sections: 出力するセクション数の目安
+    
+    Returns:
+        要約テキスト
+    """
+    import google.generativeai as genai
+    
+    # APIキーを環境変数から取得（設定されていない場合はデフォルト値を使用）
+    api_key = os.environ.get("GEMINI_API_KEY", "AIzaSyDCcm6vkvcTeq8DU4cLvgS6yGC4nED9SbM")
+    genai.configure(api_key=api_key)
+    
+    # Gemini 2.5 Flashモデルを使用（高速で高品質）
+    model = genai.GenerativeModel("gemini-2.5-flash")
+    
+    # プロンプトを作成
+    prompt = f"""あなたは日本語の要約編集者です。以下の文字起こしを読み、内容を{num_sections}つのセクションに整理して要約してください。
+
+ルール：
+- 各セクションは番号付きの見出しで始めてください（例：1. 経済政策について）
+- 各セクションには2〜4個の箇条書きを含めてください
+- 内容を捏造せず、固有名詞・数値・政策名は正確に保持してください
+- 重要なポイントを漏らさず、具体的な内容を含めてください
+
+以下のテキストを要約してください：
+
+{text}"""
+    
+    print("Gemini APIで要約を生成中...")
+    start_time = time.time()
+    
+    # 生成
+    response = model.generate_content(prompt)
+    
+    end_time = time.time()
+    print(f"Gemini API要約完了: {end_time - start_time:.2f}秒")
+    
+    return response.text
+
+
+def export_summary(input_path: str, output_path: str, num_sections: int = 5) -> bool:
+    """
+    Gemini APIを使用して要約を生成してファイルに出力する
     
     Args:
         input_path: 入力ファイルのパス
-        num_bullets: 抽出する箇条書きの数
+        output_path: 出力ファイルのパス
+        num_sections: 出力するセクション数の目安
     
     Returns:
-        箇条書き形式の要約
-    """
-    print("要約処理を開始します...")
-    summary_start = time.time()
-    
-    # ファイルを読み込む
-    with open(input_path, encoding="utf-8") as f:
-        text = f.read()
-    
-    # 文に分割
-    sentences = extract_sentences(text)
-    print(f"抽出された文の数: {len(sentences)}")
-    
-    if len(sentences) == 0:
-        return "要約できる文が見つかりませんでした。"
-    
-    if len(sentences) <= num_bullets:
-        # 文が少ない場合はすべて返す
-        bullets = ["・" + s for s in sentences]
-        return "\n".join(bullets)
-    
-    # Janomeでトークン化してTF-IDF用のテキストを準備
-    janome = JanomeTokenizer()
-    tokenized_sentences = []
-    for sentence in sentences:
-        tokens = janome.tokenize(sentence)
-        words = [t.surface for t in tokens if len(t.surface) > 1]
-        tokenized_sentences.append(" ".join(words))
-    
-    # TF-IDFベクトルを計算
-    try:
-        vectorizer = TfidfVectorizer()
-        tfidf_matrix = vectorizer.fit_transform(tokenized_sentences)
-    except Exception as e:
-        print(f"TF-IDF計算エラー: {e}")
-        # フォールバック: 最初のnum_bullets文を返す
-        bullets = ["・" + s for s in sentences[:num_bullets]]
-        return "\n".join(bullets)
-    
-    # 文間の類似度行列を計算
-    similarity_matrix = cosine_similarity(tfidf_matrix)
-    
-    # TextRankスコアを計算（PageRankの簡易版）
-    scores = np.zeros(len(sentences))
-    damping = 0.85
-    iterations = 30
-    
-    for _ in range(iterations):
-        new_scores = np.zeros(len(sentences))
-        for i in range(len(sentences)):
-            for j in range(len(sentences)):
-                if i != j and similarity_matrix[i][j] > 0:
-                    # 類似度で重み付けしたスコアを加算
-                    row_sum = similarity_matrix[j].sum() - similarity_matrix[j][j]
-                    if row_sum > 0:
-                        new_scores[i] += damping * (similarity_matrix[i][j] / row_sum) * scores[j]
-            new_scores[i] += (1 - damping)
-        scores = new_scores
-    
-    # スコアが高い文を選択
-    ranked_indices = np.argsort(scores)[::-1]
-    
-    # 重複を避けながら上位の文を選択
-    selected_indices = []
-    selected_sentences = []
-    for idx in ranked_indices:
-        if len(selected_indices) >= num_bullets:
-            break
-        sentence = sentences[idx]
-        # 類似した文がすでに選択されていないか確認
-        is_duplicate = False
-        for selected in selected_sentences:
-            # 簡易的な重複チェック（文字の重複率）
-            overlap = len(set(sentence) & set(selected)) / max(len(set(sentence)), 1)
-            if overlap > 0.7:
-                is_duplicate = True
-                break
-        if not is_duplicate:
-            selected_indices.append(idx)
-            selected_sentences.append(sentence)
-    
-    # 元の順序でソート
-    selected_indices.sort()
-    
-    # 箇条書き形式で出力
-    bullets = []
-    for idx in selected_indices:
-        bullets.append("・" + sentences[idx])
-    
-    summary_end = time.time()
-    print(f"要約処理時間: {summary_end - summary_start:.2f}秒")
-    
-    return "\n".join(bullets)
-
-
-def export_summary(input_path: str, output_path: str, num_bullets: int = 5) -> bool:
-    """
-    要約を生成してファイルに出力する
+        成功した場合はTrue、失敗した場合はFalse
     """
     try:
-        summary = summarize_text_extractive(input_path, num_bullets)
+        # ファイルを読み込む
+        with open(input_path, encoding="utf-8") as f:
+            text = f.read()
+        
+        if not text.strip():
+            print("要約できるテキストが見つかりませんでした。")
+            return False
+        
+        print(f"入力テキスト長: {len(text)}文字")
+        
+        # Gemini APIで要約を生成
+        summary = summarize_with_gemini(text, num_sections)
+        
         with open(output_path, "w", encoding="utf-8") as f:
             f.write("【要約】\n\n")
             f.write(summary)
@@ -599,6 +559,8 @@ def export_summary(input_path: str, output_path: str, num_bullets: int = 5) -> b
         return True
     except Exception as e:
         print(f"要約処理中にエラーが発生しました: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 
@@ -712,6 +674,6 @@ if is_do_summarization:
         summary_input_path = output_path
     
     if os.path.exists(summary_input_path):
-        result: bool = export_summary(summary_input_path, output_summary_path, num_bullets=5)
+        result: bool = export_summary(summary_input_path, output_summary_path, num_sections=5)
     else:
         print(f"要約の入力ファイルが見つかりません: {summary_input_path}")
