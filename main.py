@@ -553,33 +553,79 @@ def load_llm_model():
         raise
 
 
-def split_text_into_chunks(text: str, max_chars: int = 3000) -> list:
+def split_text_into_chunks_by_tokens(text: str, tokenizer, max_tokens: int = 2000) -> list:
     """
-    テキストを文境界でチャンクに分割する
+    テキストをトークン数ベースで文境界でチャンクに分割する
     
     Args:
         text: 入力テキスト
-        max_chars: 各チャンクの最大文字数
+        tokenizer: トークナイザー
+        max_tokens: 各チャンクの最大トークン数（プロンプト用に余裕を持たせる）
     
     Returns:
         チャンクのリスト
     """
     sentences = extract_sentences(text)
     
+    if not sentences:
+        return [text] if text.strip() else []
+    
     chunks = []
     current_chunk = ""
+    current_tokens = 0
     
     for sentence in sentences:
-        if len(current_chunk) + len(sentence) > max_chars and current_chunk:
+        # 文のトークン数を計算
+        sentence_tokens = len(tokenizer.encode(sentence, add_special_tokens=False))
+        
+        if current_tokens + sentence_tokens > max_tokens and current_chunk:
             chunks.append(current_chunk.strip())
             current_chunk = sentence
+            current_tokens = sentence_tokens
         else:
             current_chunk += sentence
+            current_tokens += sentence_tokens
     
     if current_chunk.strip():
         chunks.append(current_chunk.strip())
     
     return chunks
+
+
+def clean_summary_output(summary: str) -> str:
+    """
+    要約出力をクリーンアップする
+    空の箇条書きや不正な出力を除去する
+    
+    Args:
+        summary: 生成された要約テキスト
+    
+    Returns:
+        クリーンアップされた要約
+    """
+    lines = summary.split('\n')
+    cleaned_lines = []
+    
+    for line in lines:
+        stripped = line.strip()
+        # 空行は保持（段落区切り用）
+        if not stripped:
+            if cleaned_lines and cleaned_lines[-1] != '':
+                cleaned_lines.append('')
+            continue
+        # 「・」だけの行や、「・」と空白だけの行は除去
+        if stripped == '・' or stripped.replace('・', '').replace(' ', '').replace('　', '') == '':
+            continue
+        # 「・」で始まるが内容が5文字未満の行は除去
+        if stripped.startswith('・') and len(stripped) < 6:
+            continue
+        cleaned_lines.append(line)
+    
+    # 末尾の空行を除去
+    while cleaned_lines and cleaned_lines[-1] == '':
+        cleaned_lines.pop()
+    
+    return '\n'.join(cleaned_lines)
 
 
 def summarize_chunk_with_llm(text: str, model, tokenizer) -> str:
@@ -597,12 +643,21 @@ def summarize_chunk_with_llm(text: str, model, tokenizer) -> str:
     import torch
     
     # プロンプトテンプレート（ELYZA形式）
+    # 明確な指示と出力例を含める
     prompt = f"""[INST] <<SYS>>
 あなたは日本語の要約編集者です。以下の文字起こしを読み、内容を捏造せず、重要なトピックを整理して要約してください。
-出力は必ず箇条書き形式で、各項目は「・」で始めてください。
-3〜5個の重要なポイントを抽出してください。
-固有名詞・数値・政策名は可能な限り保持してください。
-感想や意見は禁止です。
+
+ルール：
+- 出力は必ず箇条書き形式で、各項目は「・」で始めてください
+- 各項目は必ず10文字以上の具体的な内容を含めてください
+- 3〜5個の重要なポイントを抽出してください
+- 固有名詞・数値・政策名は可能な限り保持してください
+- 空の箇条書きは禁止です
+
+出力例：
+・経済成長率は前年比2.5%増加し、政府目標を達成した
+・日銀は金融緩和政策を継続する方針を示した
+・消費者物価指数は3ヶ月連続で上昇傾向にある
 <</SYS>>
 
 以下のテキストを要約してください：
@@ -610,23 +665,31 @@ def summarize_chunk_with_llm(text: str, model, tokenizer) -> str:
 {text}
 [/INST]"""
     
-    # トークン化
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=4096)
+    # トークン化（truncationを無効化して警告を出す）
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=False)
+    input_length = inputs["input_ids"].shape[1]
+    
+    # 入力が長すぎる場合は警告
+    if input_length > 3500:
+        print(f"警告: 入力トークン数が多いです ({input_length} tokens)")
+        # 安全のため切り詰める
+        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=3500)
     
     # デバイスに移動
     device = next(model.parameters()).device
     inputs = {k: v.to(device) for k, v in inputs.items()}
     
-    # 生成
+    # 生成（グリーディデコーディングで安定した出力を得る）
     with torch.no_grad():
         outputs = model.generate(
             **inputs,
             max_new_tokens=512,
-            temperature=0.3,
-            do_sample=True,
-            top_p=0.9,
-            repetition_penalty=1.1,
-            pad_token_id=tokenizer.eos_token_id
+            do_sample=False,  # グリーディデコーディング
+            num_beams=1,
+            repetition_penalty=1.2,
+            no_repeat_ngram_size=3,
+            pad_token_id=tokenizer.eos_token_id,
+            eos_token_id=tokenizer.eos_token_id
         )
     
     # デコード
@@ -637,6 +700,9 @@ def summarize_chunk_with_llm(text: str, model, tokenizer) -> str:
         summary = generated_text.split("[/INST]")[-1].strip()
     else:
         summary = generated_text[len(prompt):].strip()
+    
+    # 出力をクリーンアップ
+    summary = clean_summary_output(summary)
     
     return summary
 
@@ -668,9 +734,12 @@ def summarize_text_with_llm(input_path: str, num_sections: int = 5) -> str:
     # LLMモデルをロード
     model, tokenizer = load_llm_model()
     
-    # テキストをチャンクに分割
-    chunks = split_text_into_chunks(text, max_chars=3000)
+    # テキストをトークン数ベースでチャンクに分割（プロンプト用に余裕を持たせる）
+    chunks = split_text_into_chunks_by_tokens(text, tokenizer, max_tokens=2000)
     print(f"チャンク数: {len(chunks)}")
+    
+    if len(chunks) == 0:
+        return "要約できるテキストが見つかりませんでした。"
     
     if len(chunks) == 1:
         # 短いテキストは直接要約
@@ -682,7 +751,11 @@ def summarize_text_with_llm(input_path: str, num_sections: int = 5) -> str:
         for i, chunk in enumerate(chunks):
             print(f"チャンク {i+1}/{len(chunks)} を要約中...")
             chunk_summary = summarize_chunk_with_llm(chunk, model, tokenizer)
-            chunk_summaries.append(chunk_summary)
+            if chunk_summary.strip():  # 空でない要約のみ追加
+                chunk_summaries.append(chunk_summary)
+        
+        if not chunk_summaries:
+            return "要約を生成できませんでした。"
         
         # Step 2: チャンク要約を統合して最終要約を生成
         combined_summaries = "\n\n".join(chunk_summaries)
@@ -695,16 +768,20 @@ def summarize_text_with_llm(input_path: str, num_sections: int = 5) -> str:
 あなたは日本語の要約編集者です。以下は長い文字起こしの各部分の要約です。
 これらを統合して、全体の内容を{num_sections}つのセクションにまとめてください。
 
-出力形式：
-1. 見出し：〜
-・要点...
-・要点...
+ルール：
+- 各セクションは番号付きの見出しで始めてください
+- 各セクションには2〜4個の箇条書き（・で始まる）を含めてください
+- 各箇条書きは必ず10文字以上の具体的な内容を含めてください
+- 空の箇条書きは禁止です
+- 内容を捏造せず、固有名詞・数値は保持してください
 
-2. 見出し：〜
-・要点...
+出力例：
+1. 経済政策について
+・政府は来年度の経済成長率を2.5%と予測している
+・日銀は金融緩和政策を継続する方針を示した
 
-のように、番号付きの見出しと箇条書きで構成してください。
-内容を捏造せず、固有名詞・数値は保持してください。
+2. 政局分析
+・与党は次期選挙に向けて政策調整を進めている
 <</SYS>>
 
 以下の要約を統合してください：
@@ -712,19 +789,29 @@ def summarize_text_with_llm(input_path: str, num_sections: int = 5) -> str:
 {combined_summaries}
 [/INST]"""
         
-        inputs = tokenizer(final_prompt, return_tensors="pt", truncation=True, max_length=4096)
+        # トークン化（truncationを無効化して警告を出す）
+        inputs = tokenizer(final_prompt, return_tensors="pt", truncation=False)
+        input_length = inputs["input_ids"].shape[1]
+        
+        # 入力が長すぎる場合は警告して切り詰める
+        if input_length > 3500:
+            print(f"警告: 統合プロンプトのトークン数が多いです ({input_length} tokens)")
+            inputs = tokenizer(final_prompt, return_tensors="pt", truncation=True, max_length=3500)
+        
         device = next(model.parameters()).device
         inputs = {k: v.to(device) for k, v in inputs.items()}
         
+        # グリーディデコーディングで安定した出力を得る
         with torch.no_grad():
             outputs = model.generate(
                 **inputs,
                 max_new_tokens=1024,
-                temperature=0.3,
-                do_sample=True,
-                top_p=0.9,
-                repetition_penalty=1.1,
-                pad_token_id=tokenizer.eos_token_id
+                do_sample=False,  # グリーディデコーディング
+                num_beams=1,
+                repetition_penalty=1.2,
+                no_repeat_ngram_size=3,
+                pad_token_id=tokenizer.eos_token_id,
+                eos_token_id=tokenizer.eos_token_id
             )
         
         generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
@@ -733,6 +820,9 @@ def summarize_text_with_llm(input_path: str, num_sections: int = 5) -> str:
             summary = generated_text.split("[/INST]")[-1].strip()
         else:
             summary = generated_text[len(final_prompt):].strip()
+        
+        # 出力をクリーンアップ
+        summary = clean_summary_output(summary)
     
     summary_end = time.time()
     print(f"LLM要約処理時間: {summary_end - summary_start:.2f}秒")
