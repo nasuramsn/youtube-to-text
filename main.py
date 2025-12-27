@@ -553,14 +553,14 @@ def load_llm_model():
         raise
 
 
-def split_text_into_chunks_by_tokens(text: str, tokenizer, max_tokens: int = 2000) -> list:
+def split_text_into_chunks_by_tokens(text: str, tokenizer, max_tokens: int = 1200) -> list:
     """
     テキストをトークン数ベースで文境界でチャンクに分割する
     
     Args:
         text: 入力テキスト
         tokenizer: トークナイザー
-        max_tokens: 各チャンクの最大トークン数（プロンプト用に余裕を持たせる）
+        max_tokens: 各チャンクの最大トークン数（プロンプト用に余裕を持たせる, デフォルト: 1200）
     
     Returns:
         チャンクのリスト
@@ -681,9 +681,11 @@ def summarize_chunk_with_llm(text: str, model, tokenizer) -> str:
     
     # 生成（グリーディデコーディングで安定した出力を得る）
     with torch.no_grad():
+        # RTX 3070Ti Laptop (8GB 前後を想定) では 7B モデル + 長コンテキストで
+        # 512 トークン生成はかなり重いため、max_new_tokens を 256 に抑える
         outputs = model.generate(
             **inputs,
-            max_new_tokens=512,
+            max_new_tokens=256,
             do_sample=False,  # グリーディデコーディング
             num_beams=1,
             repetition_penalty=1.2,
@@ -734,8 +736,10 @@ def summarize_text_with_llm(input_path: str, num_sections: int = 5) -> str:
     # LLMモデルをロード
     model, tokenizer = load_llm_model()
     
-    # テキストをトークン数ベースでチャンクに分割（プロンプト用に余裕を持たせる）
-    chunks = split_text_into_chunks_by_tokens(text, tokenizer, max_tokens=2000)
+    # テキストをトークン数ベースでチャンクに分割（RTX 3070Ti Laptop 想定でやや小さめに分割）
+    # チャンクが大きすぎると 7B モデル + CPU オフロード環境で generate が極端に遅くなるため、
+    # 1 チャンクあたりおよそ 1200 トークンを目安に分割する
+    chunks = split_text_into_chunks_by_tokens(text, tokenizer, max_tokens=1200)
     print(f"チャンク数: {len(chunks)}")
     
     if len(chunks) == 0:
@@ -803,9 +807,10 @@ def summarize_text_with_llm(input_path: str, num_sections: int = 5) -> str:
         
         # グリーディデコーディングで安定した出力を得る
         with torch.no_grad():
+            # 最終統合要約も生成トークン数を抑えて計算量を削減
             outputs = model.generate(
                 **inputs,
-                max_new_tokens=1024,
+                max_new_tokens=512,
                 do_sample=False,  # グリーディデコーディング
                 num_beams=1,
                 repetition_penalty=1.2,
