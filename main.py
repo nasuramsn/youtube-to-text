@@ -835,9 +835,54 @@ def summarize_text_with_llm(input_path: str, num_sections: int = 5) -> str:
     return summary
 
 
+def summarize_with_gemini(text: str, num_sections: int = 5) -> str:
+    """
+    Gemini APIを使用してテキストを要約する
+    
+    Args:
+        text: 要約するテキスト
+        num_sections: 出力するセクション数の目安
+    
+    Returns:
+        要約テキスト
+    """
+    import google.generativeai as genai
+    
+    # APIキーを環境変数から取得（設定されていない場合はデフォルト値を使用）
+    api_key = os.environ.get("GEMINI_API_KEY", "AIzaSyDCcm6vkvcTeq8DU4cLvgS6yGC4nED9SbM")
+    genai.configure(api_key=api_key)
+    
+    # Gemini 2.5 Flashモデルを使用（高速で高品質）
+    model = genai.GenerativeModel("gemini-2.5-flash")
+    
+    # プロンプトを作成
+    prompt = f"""あなたは日本語の要約編集者です。以下の文字起こしを読み、内容を{num_sections}つのセクションに整理して要約してください。
+
+ルール：
+- 各セクションは番号付きの見出しで始めてください（例：1. 経済政策について）
+- 各セクションには2〜4個の箇条書きを含めてください
+- 内容を捏造せず、固有名詞・数値・政策名は正確に保持してください
+- 重要なポイントを漏らさず、具体的な内容を含めてください
+
+以下のテキストを要約してください：
+
+{text}"""
+    
+    print("Gemini APIで要約を生成中...")
+    start_time = time.time()
+    
+    # 生成
+    response = model.generate_content(prompt)
+    
+    end_time = time.time()
+    print(f"Gemini API要約完了: {end_time - start_time:.2f}秒")
+    
+    return response.text
+
+
 def export_summary(input_path: str, output_path: str, num_sections: int = 5) -> bool:
     """
-    LLMを使用して要約を生成してファイルに出力する
+    Gemini APIを使用して要約を生成してファイルに出力する
     
     Args:
         input_path: 入力ファイルのパス
@@ -848,7 +893,19 @@ def export_summary(input_path: str, output_path: str, num_sections: int = 5) -> 
         成功した場合はTrue、失敗した場合はFalse
     """
     try:
-        summary = summarize_text_with_llm(input_path, num_sections)
+        # ファイルを読み込む
+        with open(input_path, encoding="utf-8") as f:
+            text = f.read()
+        
+        if not text.strip():
+            print("要約できるテキストが見つかりませんでした。")
+            return False
+        
+        print(f"入力テキスト長: {len(text)}文字")
+        
+        # Gemini APIで要約を生成
+        summary = summarize_with_gemini(text, num_sections)
+        
         with open(output_path, "w", encoding="utf-8") as f:
             f.write("【要約】\n\n")
             f.write(summary)
@@ -857,6 +914,8 @@ def export_summary(input_path: str, output_path: str, num_sections: int = 5) -> 
         return True
     except Exception as e:
         print(f"要約処理中にエラーが発生しました: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 
