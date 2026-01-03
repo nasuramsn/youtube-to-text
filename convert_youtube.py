@@ -1,0 +1,400 @@
+import array
+import os
+import time
+
+import librosa
+import numpy as np
+import soundfile as sf
+import whisper
+import yt_dlp
+from resemblyzer import VoiceEncoder, preprocess_wav
+from sklearn.cluster import AgglomerativeClustering
+
+
+def download_youtube(ydl_opts, video_url: str, audio_file: str):
+    print("YouTube動画をダウンロードしてMP3に変換しています...")
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([video_url])
+        print(f"ダウンロードが完了しました: {audio_file}")
+    except Exception as e:
+        print(f"ダウンロード中にエラーが発生しました: {e}")
+
+
+def check_exist_mp3(audio_file: str) -> bool:
+    if not os.path.isfile(audio_file):
+        return False
+    else:
+        return True
+
+
+def load_wisper_model() -> array:
+    print("Whisperモデルをロードしています...")
+    try:
+        model = whisper.load_model("large", device="cpu")
+        _ = model.half()
+        _ = model.cuda()
+
+        for m in model.modules():
+            if isinstance(m, whisper.model.LayerNorm):
+                m.float()
+        print("Whisperモデルが正しくロードされました。")
+        return [True, model]
+    except Exception as e:
+        # print(f"Whisperモデルのロード中にエラーが発生しました: {e}")
+        return [False, e]
+
+
+def transcription(
+    model, output_path: str, data_resampled: array, chunk_size: int, language: str
+) -> bool:
+    # 音声ファイルをチャンクに分割して処理
+    # 英語で文字起こししたいときはlanguage='en'にする。
+    text_start = time.time()
+    print("音声ファイルをチャンクに分割して文字起こしを開始します...")
+    for i in range(0, len(data_resampled), chunk_size):
+        chunk = data_resampled[i : i + chunk_size]
+        try:
+            result = model.transcribe(
+                chunk,
+                verbose=True,
+                language=language,
+                fp16=True,
+                without_timestamps=True,
+            )
+            chunk_transcription = result["text"]
+
+            # 部分的な文字起こし結果をファイルに追記
+            with open(output_path, "a", encoding="utf-8") as file:
+                file.write(chunk_transcription + "\n")
+        except Exception as e:
+            print(f"チャンク {i//chunk_size + 1} の文字起こし中にエラーが発生しました: {e}")
+            return False
+
+    text_end = time.time()
+    text_time = text_end - text_start
+    print(f"Text出力時間: {text_time}")
+    print(f"文字起こし結果が {output_path} に保存されました。")
+
+    return True
+
+
+def convert_audio_to_monoral(audio_file: str, model) -> array:
+    print("オーディオファイルを読み込みます...")
+    try:
+        data, samplerate = sf.read(audio_file)
+        print(
+            f"オーディオファイルが正常に読み取られました。サンプルレート: {samplerate}, サイズ: {data.shape} バイト"
+        )
+    except Exception as e:
+        return [False, e]
+        # raise RuntimeError(f"オーディオファイルを開く際にエラーが発生しました: {e}")
+
+    convert_start = time.time()
+
+    # サンプルレートを16kHzに変更し、モノラルに変換
+    print("オーディオを16kHzモノラルに変換します...")
+    try:
+        data_mono = librosa.to_mono(data.T)
+        data_resampled = librosa.resample(data_mono, orig_sr=samplerate, target_sr=16000)
+        data_resampled = data_resampled.astype(np.float32)
+        print(f"変換が完了しました。新しいサイズ: {data_resampled.shape}")
+    except Exception as e:
+        # raise RuntimeError(f"オーディオ変換中にエラーが発生しました: {e}")
+        return [False, e]
+    convert_end = time.time()
+    convert_time = convert_end - convert_start
+    print(f"変換時間: {convert_time}")
+    return [True, data_resampled]
+
+
+def perform_speaker_diarization(audio_file: str, num_speakers: int = None) -> list:
+    """
+    音声ファイルから話者分離を行う
+
+    Args:
+        audio_file: 音声ファイルのパス
+        num_speakers: 話者数（Noneの場合は自動推定）
+
+    Returns:
+        話者セグメントのリスト: [(start_time, end_time, speaker_id), ...]
+    """
+    print("話者分離を開始します...")
+    diarization_start = time.time()
+
+    # Voice encoderをロード
+    print("Voice Encoderをロードしています...")
+    encoder = VoiceEncoder()
+
+    # 音声ファイルを読み込み・前処理
+    print(f"音声ファイルを読み込んでいます: {audio_file}")
+    wav = preprocess_wav(audio_file)
+
+    # セグメント分割のパラメータ
+    segment_duration = 1.5  # 各セグメントの長さ（秒）
+    step_duration = 0.75  # セグメント間のステップ（秒）
+    sample_rate = 16000
+
+    segment_samples = int(segment_duration * sample_rate)
+    step_samples = int(step_duration * sample_rate)
+
+    # 音声をセグメントに分割してembeddingを計算
+    print("音声セグメントのembeddingを計算しています...")
+    embeddings = []
+    segment_times = []
+
+    for start_sample in range(0, len(wav) - segment_samples, step_samples):
+        end_sample = start_sample + segment_samples
+        segment = wav[start_sample:end_sample]
+
+        # セグメントが短すぎる場合はスキップ
+        if len(segment) < segment_samples * 0.5:
+            continue
+
+        try:
+            embedding = encoder.embed_utterance(segment)
+            embeddings.append(embedding)
+            start_time = start_sample / sample_rate
+            end_time = end_sample / sample_rate
+            segment_times.append((start_time, end_time))
+        except Exception as e:
+            print(f"セグメント {start_sample} でエラー: {e}")
+            continue
+
+    if len(embeddings) == 0:
+        print("有効なセグメントが見つかりませんでした")
+        return []
+
+    embeddings = np.array(embeddings)
+    print(f"計算されたembedding数: {len(embeddings)}")
+
+    # クラスタリングで話者を分離
+    print("話者クラスタリングを実行しています...")
+    if num_speakers is None:
+        # 話者数を自動推定（2-5人の範囲で最適なクラスタ数を探す）
+        from sklearn.metrics import silhouette_score
+
+        best_score = -1
+        best_n = 2
+        for n in range(2, min(6, len(embeddings))):
+            try:
+                clustering = AgglomerativeClustering(n_clusters=n)
+                labels = clustering.fit_predict(embeddings)
+                score = silhouette_score(embeddings, labels)
+                if score > best_score:
+                    best_score = score
+                    best_n = n
+            except Exception:
+                continue
+        num_speakers = best_n
+
+    clustering = AgglomerativeClustering(n_clusters=num_speakers)
+    labels = clustering.fit_predict(embeddings)
+
+    # セグメントと話者ラベルを結合
+    speaker_segments = []
+    for i, (start_time, end_time) in enumerate(segment_times):
+        speaker_id = labels[i]
+        speaker_segments.append((start_time, end_time, speaker_id))
+
+    # 連続する同じ話者のセグメントをマージ
+    merged_segments = []
+    if speaker_segments:
+        current_start, current_end, current_speaker = speaker_segments[0]
+        for start_time, end_time, speaker_id in speaker_segments[1:]:
+            if speaker_id == current_speaker:
+                current_end = end_time
+            else:
+                merged_segments.append((current_start, current_end, current_speaker))
+                current_start, current_end, current_speaker = start_time, end_time, speaker_id
+        merged_segments.append((current_start, current_end, current_speaker))
+
+    diarization_end = time.time()
+    print(f"話者分離完了。処理時間: {diarization_end - diarization_start:.2f}秒")
+    print(f"検出されたセグメント数: {len(merged_segments)}")
+
+    return merged_segments
+
+
+def transcription_with_timestamps(
+    model, data_resampled: array, chunk_size: int, language: str
+) -> list:
+    """
+    タイムスタンプ付きで文字起こしを行う
+
+    Returns:
+        セグメントのリスト: [(start_time, end_time, text), ...]
+    """
+    print("タイムスタンプ付き文字起こしを開始します...")
+    all_segments = []
+
+    for chunk_idx, i in enumerate(range(0, len(data_resampled), chunk_size)):
+        chunk = data_resampled[i : i + chunk_size]
+        chunk_start_time = i / 16000  # 16kHzサンプルレート
+
+        try:
+            result = model.transcribe(
+                chunk,
+                verbose=False,
+                language=language,
+                fp16=True,
+                without_timestamps=False,  # タイムスタンプを有効化
+            )
+
+            for segment in result.get("segments", []):
+                start = chunk_start_time + segment["start"]
+                end = chunk_start_time + segment["end"]
+                text = segment["text"].strip()
+                if text:
+                    all_segments.append((start, end, text))
+
+            print(f"チャンク {chunk_idx + 1} の文字起こしが完了しました。")
+        except Exception as e:
+            print(f"チャンク {chunk_idx + 1} の文字起こし中にエラーが発生しました: {e}")
+            continue
+
+    return all_segments
+
+
+def align_transcription_with_speakers(
+    transcription_segments: list, speaker_segments: list
+) -> list:
+    """
+    文字起こしセグメントと話者セグメントを時間で照合する
+
+    Args:
+        transcription_segments: [(start, end, text), ...]
+        speaker_segments: [(start, end, speaker_id), ...]
+
+    Returns:
+        話者付きセグメント: [(start, end, speaker_id, text), ...]
+    """
+    print("文字起こしと話者情報を照合しています...")
+    aligned_segments = []
+
+    for trans_start, trans_end, text in transcription_segments:
+        trans_mid = (trans_start + trans_end) / 2
+
+        # 最も重複が大きい話者セグメントを見つける
+        best_speaker = 0
+        best_overlap = 0
+
+        for spk_start, spk_end, speaker_id in speaker_segments:
+            # 重複区間を計算
+            overlap_start = max(trans_start, spk_start)
+            overlap_end = min(trans_end, spk_end)
+            overlap = max(0, overlap_end - overlap_start)
+
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_speaker = speaker_id
+
+        aligned_segments.append((trans_start, trans_end, best_speaker, text))
+
+    return aligned_segments
+
+
+def export_diarized_transcription(aligned_segments: list, output_path: str) -> bool:
+    """
+    話者分離された文字起こし結果をファイルに出力する
+    """
+    print(f"話者分離結果を {output_path} に保存しています...")
+
+    try:
+        with open(output_path, "w", encoding="utf-8") as f:
+            current_speaker = None
+            for start, end, speaker_id, text in aligned_segments:
+                if speaker_id != current_speaker:
+                    if current_speaker is not None:
+                        f.write("\n")
+                    f.write(f"SPEAKER_{speaker_id}:\n")
+                    current_speaker = speaker_id
+                f.write(f"{text}\n")
+
+        print(f"話者分離結果が {output_path} に保存されました。")
+        return True
+    except Exception as e:
+        print(f"ファイル出力中にエラーが発生しました: {e}")
+        return False
+
+
+def run_output_to_text(audio_file: str, model, download_dir: str, output_path: str) -> bool:
+    """
+    音声ファイルから通常の文字起こしテキストを生成する処理
+    （従来 is_do_output_to_text ブロックだった部分を関数化）
+    """
+    # オーディオファイルを読み込む
+    convert_audio_result = convert_audio_to_monoral(audio_file, model)
+    if not convert_audio_result:
+        raise RuntimeError("オーディオの変換に失敗しました")
+    else:
+        data_resampled = convert_audio_result[1]
+
+    # チャンクサイズを設定（例: 60秒ごとに分割）
+    chunk_size = 60 * 16000  # 60秒 * 16kHz
+
+    # テキストファイルの保存先ディレクトリ
+    os.makedirs(download_dir, exist_ok=True)
+
+    # 既存のファイルがあれば削除
+    if os.path.exists(output_path):
+        os.remove(output_path)
+
+    # 文字起こし開始
+    result: bool = transcription(model, output_path, data_resampled, chunk_size, "ja")
+    return result
+
+
+def run_speaker_diarization_flow(
+    audio_file: str,
+    model,
+    download_dir: str,
+    data_resampled=None,
+) -> bool:
+    """
+    話者分離付き文字起こしの一連の処理
+    （従来 is_do_speaker_diarization ブロックだった部分を関数化）
+    """
+    output_diarization_path: str = os.path.join(download_dir, "diarization.txt")
+    if os.path.exists(output_diarization_path):
+        os.remove(output_diarization_path)
+
+    # オーディオファイルを読み込む（まだ読み込んでいない場合）
+    if data_resampled is None:
+        convert_audio_result = convert_audio_to_monoral(audio_file, model)
+        if not convert_audio_result[0]:
+            raise RuntimeError("オーディオの変換に失敗しました")
+        data_resampled = convert_audio_result[1]
+
+    # Whisperモデルをロード（まだロードしていない場合）
+    if model is None:
+        load_whisper_result = load_wisper_model()
+        if not load_whisper_result[0]:
+            raise RuntimeError(
+                f"Whisperモデルのロード中にエラーが発生しました: {load_whisper_result[1]}"
+            )
+        model = load_whisper_result[1]
+
+    # チャンクサイズを設定
+    chunk_size = 60 * 16000  # 60秒 * 16kHz
+
+    # 話者分離を実行
+    print("話者分離処理を開始します...")
+    speaker_segments = perform_speaker_diarization(audio_file)
+
+    # タイムスタンプ付き文字起こしを実行
+    transcription_segments = transcription_with_timestamps(
+        model, data_resampled, chunk_size, "ja"
+    )
+
+    # 文字起こしと話者情報を照合
+    aligned_segments = align_transcription_with_speakers(
+        transcription_segments, speaker_segments
+    )
+
+    # 結果を出力
+    result: bool = export_diarized_transcription(
+        aligned_segments, output_diarization_path
+    )
+    print(f"話者分離付き文字起こし結果が {output_diarization_path} に保存されました。")
+    return result

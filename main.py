@@ -1,44 +1,357 @@
-import array
-import yt_dlp
-import whisper
 import os
-import numpy as np
-import soundfile as sf
-import librosa
 import time
 import sys
+from datetime import datetime
 
+import boto3
 from transformers import pipeline
 from janome.tokenizer import Tokenizer as JanomeTokenizer
-from resemblyzer import VoiceEncoder, preprocess_wav
-from sklearn.cluster import AgglomerativeClustering
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+
+from convert_youtube import (
+    download_youtube,
+    check_exist_mp3,
+    load_wisper_model,
+    run_output_to_text,
+    run_speaker_diarization_flow,
+)
+
+
+def validate_channel_and_date(channel: str, record_date: str) -> None:
+    """
+    channel と date(yyyyMMDD) のバリデーションを行う
+    不正な場合は ValueError を送出する
+    """
+    # channel: 空は禁止、ファイル名やパスで問題になりそうな文字は弾く
+    if not channel:
+        raise ValueError("channel が指定されていません。例: MyChannel")
+
+    invalid_chars = r'\/:*?"<>|'
+    if any(c in channel for c in invalid_chars):
+        raise ValueError(f"channel に使用できない文字が含まれています: {invalid_chars}")
+
+    # date: yyyyMMDD の8桁数字かつ実在する日付
+    if not record_date:
+        raise ValueError("date が指定されていません。フォーマット: yyyyMMDD (例: 20250101)")
+
+    if len(record_date) != 8 or not record_date.isdigit():
+        raise ValueError("date は 8桁の数字で指定してください。フォーマット: yyyyMMDD (例: 20250101)")
+
+    try:
+        datetime.strptime(record_date, "%Y%m%d")
+    except ValueError:
+        raise ValueError("date が有効な日付ではありません。yyyyMMDD 形式で指定してください。")
+
+
+def validate_execution_env(env: str) -> str:
+    """
+    実行環境パラメータ（local/aws）をバリデーションして正規化して返す
+    不正な場合は ValueError を送出する
+    """
+    env_normalized = (env or "aws").lower()
+    if env_normalized not in ("local", "aws"):
+        raise ValueError('env は "local" または "aws" のいずれかで指定してください。')
+    return env_normalized
+
+
+def create_dynamodb_execute_log(
+    execution_env: str,
+    channel: str,
+    record_date: str,
+    video_url: str,
+    no: int,
+) -> int:
+    """
+    実行ログを DynamoDB に作成する
+    - テーブル名: execute_youtube_encode_log
+    - id: 既存の最大値 + 1
+    """
+    table_name = "execute_youtube_encode_log"
+
+    # 実行環境ごとのエンドポイント設定
+    if execution_env == "local":
+        endpoint_url = "http://localhost:8000"
+    else:
+        endpoint_url = os.environ.get("DYNAMODB_ENDPOINT")
+        if not endpoint_url:
+            raise RuntimeError(
+                "DYNAMODB_ENDPOINT が設定されていません（env=aws）。環境変数にエンドポイントを設定してください。"
+            )
+
+    dynamodb = boto3.resource("dynamodb", endpoint_url=endpoint_url)
+    table = dynamodb.Table(table_name)
+
+    # 既存レコードから最大 id を取得（シンプルに全スキャン）
+    max_id = 0
+    scan_kwargs = {"ProjectionExpression": "id"}
+    while True:
+        response = table.scan(**scan_kwargs)
+        items = response.get("Items", [])
+        for item in items:
+            try:
+                current_id = int(item.get("id", 0))
+                if current_id > max_id:
+                    max_id = current_id
+            except (TypeError, ValueError):
+                continue
+
+        last_evaluated_key = response.get("LastEvaluatedKey")
+        if not last_evaluated_key:
+            break
+        scan_kwargs["ExclusiveStartKey"] = last_evaluated_key
+
+    new_id = max_id + 1
+
+    # 日付のフォーマット変換
+    iso_date = datetime.strptime(record_date, "%Y%m%d").strftime("%Y-%m-%d")
+    start_dt = datetime.utcnow().isoformat() + "Z"
+
+    item = {
+        "id": new_id,
+        "channel": channel,
+        "no": no,
+        "date": iso_date,
+        "start_date_time": start_dt,
+        "url": video_url,
+        "execute_status": False,
+    }
+
+    table.put_item(Item=item)
+    print(f"DynamoDB に実行ログを作成しました: {item}")
+    return new_id
+
+
+def update_dynamodb_execute_log_result(
+    execution_env: str,
+    log_id: int,
+    success: bool,
+) -> None:
+    """
+    実行ログレコードの end_date_time と execute_status を更新する
+    """
+    table_name = "execute_youtube_encode_log"
+
+    # 実行環境ごとのエンドポイント設定
+    if execution_env == "local":
+        endpoint_url = "http://localhost:8000"
+    else:
+        endpoint_url = os.environ.get("DYNAMODB_ENDPOINT")
+        if not endpoint_url:
+            raise RuntimeError(
+                "DYNAMODB_ENDPOINT が設定されていません（env=aws）。環境変数にエンドポイントを設定してください。"
+            )
+
+    dynamodb = boto3.resource("dynamodb", endpoint_url=endpoint_url)
+    table = dynamodb.Table(table_name)
+
+    # タイムゾーン付き UTC に変更（utcnow は将来廃止予定）
+    from datetime import timezone
+
+    end_dt = datetime.now(timezone.utc).isoformat()
+
+    table.update_item(
+        Key={"id": log_id},
+        UpdateExpression="SET end_date_time = :end, execute_status = :st",
+        ExpressionAttributeValues={
+            ":end": end_dt,
+            ":st": success,
+        },
+    )
+    print(
+        f"DynamoDB の実行ログを更新しました: id={log_id}, end_date_time={end_dt}, execute_status={success}"
+    )
+
+
+def get_s3_client(execution_env: str):
+    """
+    実行環境に応じて S3 クライアントを返す
+    - local: エンドポイント http://localhost:4566
+    - aws:   環境変数 S3_ENDPOINT からエンドポイントを取得
+    """
+    if execution_env == "local":
+        endpoint_url = "http://localhost:4566"
+    else:
+        endpoint_url = os.environ.get("S3_ENDPOINT")
+        if not endpoint_url:
+            raise RuntimeError(
+                "S3_ENDPOINT が設定されていません（env=aws）。環境変数にエンドポイントを設定してください。"
+            )
+
+    return boto3.client("s3", endpoint_url=endpoint_url)
+
+
+def sanitize_bucket_name(base_name: str) -> str:
+    """
+    S3 の制約に合わせてバケット名をサニタイズする
+    - 小文字英数字とドット・ハイフンのみ許可
+    - 先頭と末尾は英数字
+    """
+    name = base_name.lower()
+    name = re.sub(r"[^a-z0-9.-]", "-", name)
+    name = re.sub(r"^[^a-z0-9]+", "", name)
+    name = re.sub(r"[^a-z0-9]+$", "", name)
+    if len(name) < 3:
+        name = f"bkt-{name}".ljust(3, "0")
+    return name
+
+
+def upload_txt_files_to_s3(
+    download_dir: str,
+    execution_env: str,
+    channel: str,
+    record_date: str,
+    no: int,
+) -> bool:
+    """
+    medias 配下の *.txt を S3 にアップロードし、ローカルのファイルを削除する
+    - バケット名: 環境変数 BUCKET_SURNIVERS_NEWS
+    - オブジェクトキー: {channel}/{yyyyMM}/{yyyyMMdd}/{no}/{filename}
+    Returns:
+        True: すべてのアップロードが成功
+        False: 途中でエラーが発生した
+    """
+    yyyy_mm = datetime.strptime(record_date, "%Y%m%d").strftime("%Y%m")
+    yyyy_mmdd = record_date  # すでに yyyyMMDD 形式
+
+    # S3 バケット名は小文字英数字とハイフンのみ・小文字推奨のため、必ず lower() で正規化する
+    raw_bucket_name = os.environ.get("BUCKET_SURNIVERS_NEWS")
+    if not raw_bucket_name:
+        raise RuntimeError(
+            "環境変数 BUCKET_SURNIVERS_NEWS が設定されていません。例: BUCKET_SURNIVERS_NEWS=surnivers-news-xxxx"
+        )
+    bucket_name = raw_bucket_name.lower()
+    base_prefix = f"{channel}/{yyyy_mm}/{yyyy_mmdd}"
+
+    s3 = get_s3_client(execution_env)
+    print(f"S3 バケットを使用します: {bucket_name}, base_prefix={base_prefix}")
+
+    try:
+        # バケットの存在確認（なければ作成）
+        existing_buckets = s3.list_buckets().get("Buckets", [])
+        if not any(b.get("Name") == bucket_name for b in existing_buckets):
+            if execution_env == "local":
+                # LocalStack 側で事前にバケットを作っておく運用にする場合は、
+                # ここでの create_bucket をスキップしたい場合もあるが、
+                # まずは us-east-1 で作成を試みる
+                from boto3.session import Session
+
+                session = Session()
+                region = (
+                    session.region_name
+                    or os.environ.get("AWS_REGION")
+                    or os.environ.get("AWS_DEFAULT_REGION")
+                    or "us-east-1"
+                )
+                if region == "us-east-1":
+                    s3.create_bucket(Bucket=bucket_name)
+                else:
+                    s3.create_bucket(
+                        Bucket=bucket_name,
+                        CreateBucketConfiguration={"LocationConstraint": region},
+                    )
+            else:
+                # AWS 環境ではリージョンに応じて LocationConstraint を指定
+                from boto3.session import Session
+
+                session = Session()
+                region = (
+                    session.region_name
+                    or os.environ.get("AWS_REGION")
+                    or os.environ.get("AWS_DEFAULT_REGION")
+                    or "us-east-1"
+                )
+                if region == "us-east-1":
+                    s3.create_bucket(Bucket=bucket_name)
+                else:
+                    s3.create_bucket(
+                        Bucket=bucket_name,
+                        CreateBucketConfiguration={"LocationConstraint": region},
+                    )
+            print(f"S3 バケットを作成しました: {bucket_name}")
+        else:
+            print(f"S3 バケットは既に存在します: {bucket_name}")
+
+        # medias 配下の *.txt をアップロード
+        if not os.path.isdir(download_dir):
+            print(f"アップロード対象ディレクトリが存在しません: {download_dir}")
+            return False
+
+        dir_prefix = str(no)
+        for filename in os.listdir(download_dir):
+            if not filename.endswith(".txt"):
+                continue
+            local_path = os.path.join(download_dir, filename)
+            if not os.path.isfile(local_path):
+                continue
+
+            if base_prefix:
+                key = f"{base_prefix}/{dir_prefix}/{filename}"
+            else:
+                key = f"{dir_prefix}/{filename}"
+            s3.upload_file(local_path, bucket_name, key)
+            print(f"S3 にアップロードしました: bucket={bucket_name}, key={key}")
+
+        # ローカル medias 配下のファイルを削除（必要に応じてコメントアウト解除）
+        # for filename in os.listdir(download_dir):
+        #     local_path = os.path.join(download_dir, filename)
+        #     if os.path.isfile(local_path):
+        #         os.remove(local_path)
+        # print(f"ローカルディレクトリ内のファイルを削除しました: {download_dir}")
+        return True
+    except Exception as e:
+        print(f"S3 アップロード中にエラーが発生しました: {e}")
+        return False
 
 # args
-# 1: YoutubeのURLの番号
-# 2: is_do_download_youtube
-# 3: is_do_download_whisper
-# 4: is_do_output_to_text
-# 5: is_do_output_punctuation
-# 6: is_do_speaker_diarization (optional, default: False)
-# 7: is_do_summarization (optional, default: False) - uses LLM for abstractive summarization
-# example: qIW9NxF34Jo True True True True True True
+# 1: YoutubeのURLの番号（動画ID）
+# 2: channel（チャンネル名などの識別子）
+# 3: date（収録・配信日など、フォーマット: yyyyMMDD）
+# 4: no（連番などの識別用番号。例: 1, 2）
+# 5: is_do_download_youtube
+# 6: is_do_download_whisper
+# 7: is_do_output_to_text
+# 8: is_do_output_punctuation
+# 9: is_do_speaker_diarization (optional, default: False)
+# 10: is_do_summarization (optional, default: False) - uses LLM for abstractive summarization
+# 11: is_do_uploads (optional, default: False) - uses upload to S3 and update DynamoDB
+# 12: env（実行環境: "local" または "aws"。省略時は "aws" として扱う）
+# example:
+#   qIW9NxF34Jo MyChannel 20250101 1 True True True True True True aws
 
 args = sys.argv
 video_url_org = "https://www.youtube.com/watch?v="
 video_url = video_url_org + args[1]
 
-is_do_download_youtube = True if args[2] == "True" else False
-is_do_download_whisper = True if args[3] == "True" else False
-is_do_output_to_text = True if args[4] == "True" else False
-is_do_output_punctuation = True if args[5] == "True" else False
-is_do_speaker_diarization = True if len(args) > 6 and args[6] == "True" else False
-is_do_summarization = True if len(args) > 7 and args[7] == "True" else False
+channel = args[2] if len(args) > 2 else ""
+record_date = args[3] if len(args) > 3 else ""
+
+# channel / date のバリデーション
+validate_channel_and_date(channel, record_date)
+
+# no パラメータ（数字）。未指定や不正値のときは 1 にフォールバック
+try:
+    no = int(args[4]) if len(args) > 4 else 1
+except ValueError:
+    no = 1
+
+# 実行環境パラメータ（local / aws）。省略時は "aws"
+raw_env = args[12] if len(args) > 12 else "aws"
+execution_env = validate_execution_env(raw_env)
+
+is_do_download_youtube = True if len(args) > 5 and args[5] == "True" else False
+is_do_download_whisper = True if len(args) > 6 and args[6] == "True" else False
+is_do_output_to_text = True if len(args) > 7 and args[7] == "True" else False
+is_do_output_punctuation = True if len(args) > 8 and args[8] == "True" else False
+is_do_speaker_diarization = True if len(args) > 9 and args[9] == "True" else False
+is_do_summarization = True if len(args) > 10 and args[10] == "True" else False
+is_do_uploads = True if len(args) > 11 and args[11] == "True" else False
 
 print(f"args: {args}")
-print(f"args[2]: {args[2]}")
-print(f"args[2]: {is_do_download_youtube}")
+print(f"video_id: {args[1] if len(args) > 1 else ''}")
+print(f"channel: {channel}")
+print(f"date: {record_date}")
+print(f"no: {no}")
+print(f"execution_env: {execution_env}")
+print(f"is_do_download_youtube: {is_do_download_youtube}")
 
 # ダウンロードディレクトリ（相対パスを使用して移植性を向上）
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -59,303 +372,6 @@ ydl_opts = {
         'preferredquality': '192',
     }],
 }
-
-
-def download_youtube(ydl_opts, video_url: str, audio_file: str):
-    print("YouTube動画をダウンロードしてMP3に変換しています...")
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([video_url])
-        print(f"ダウンロードが完了しました: {audio_file}")
-    except Exception as e:
-        print(f"ダウンロード中にエラーが発生しました: {e}")
-
-
-def check_exist_mp3(audio_file: str) -> bool:
-    if not os.path.isfile(audio_file):
-        return False
-    else:
-        return True
-
-
-def load_wisper_model() -> array:
-    print("Whisperモデルをロードしています...")
-    try:
-        model = whisper.load_model("large", device="cpu")
-        _ = model.half()
-        _ = model.cuda()
-
-        for m in model.modules():
-            if isinstance(m, whisper.model.LayerNorm):
-                m.float()
-        print("Whisperモデルが正しくロードされました。")
-        return [True, model]
-    except Exception as e:
-        # print(f"Whisperモデルのロード中にエラーが発生しました: {e}")
-        return [False, e]
-
-
-def transcription(model, output_path: str, data_resampled: array, chunk_size: int, language: str) -> bool:
-    # 音声ファイルをチャンクに分割して処理
-    # 英語で文字起こししたいときはlanguage='en'にする。
-    text_start = time.time()
-    print("音声ファイルをチャンクに分割して文字起こしを開始します...")
-    for i in range(0, len(data_resampled), chunk_size):
-        chunk = data_resampled[i:i + chunk_size]
-        try:
-            result = model.transcribe(
-                chunk,
-                verbose=True,
-                language=language,
-                fp16=True,
-                without_timestamps=True)
-            chunk_transcription = result['text']
-
-            # 部分的な文字起こし結果をファイルに追記
-            with open(output_path, "a", encoding="utf-8") as file:
-                file.write(chunk_transcription + "\n")
-        except Exception as e:
-            print(f"チャンク {i//chunk_size + 1} の文字起こし中にエラーが発生しました: {e}")
-            return False
-
-    text_end = time.time()
-    text_time = text_end - text_start
-    print(f"Text出力時間: {text_time}")
-    print(f"文字起こし結果が {output_path} に保存されました。")
-
-    return True
-
-
-def convert_audio_to_monoral(audio_file: str, model) -> array:
-    print("オーディオファイルを読み込みます...")
-    try:
-        data, samplerate = sf.read(audio_file)
-        print(f"オーディオファイルが正常に読み取られました。サンプルレート: {samplerate}, サイズ: {data.shape} バイト")
-    except Exception as e:
-        return [False, e]
-        # raise RuntimeError(f"オーディオファイルを開く際にエラーが発生しました: {e}")
-
-    convert_start = time.time()
-
-    # サンプルレートを16kHzに変更し、モノラルに変換
-    print("オーディオを16kHzモノラルに変換します...")
-    try:
-        data_mono = librosa.to_mono(data.T)
-        data_resampled = librosa.resample(data_mono, orig_sr=samplerate, target_sr=16000)
-        data_resampled = data_resampled.astype(np.float32)
-        print(f"変換が完了しました。新しいサイズ: {data_resampled.shape}")
-    except Exception as e:
-        # raise RuntimeError(f"オーディオ変換中にエラーが発生しました: {e}")
-        return [False, e]
-    convert_end = time.time()
-    convert_time = convert_end - convert_start
-    print(f"変換時間: {convert_time}")
-    return [True, data_resampled]
-
-
-def perform_speaker_diarization(audio_file: str, num_speakers: int = None) -> list:
-    """
-    音声ファイルから話者分離を行う
-    
-    Args:
-        audio_file: 音声ファイルのパス
-        num_speakers: 話者数（Noneの場合は自動推定）
-    
-    Returns:
-        話者セグメントのリスト: [(start_time, end_time, speaker_id), ...]
-    """
-    print("話者分離を開始します...")
-    diarization_start = time.time()
-    
-    # Voice encoderをロード
-    print("Voice Encoderをロードしています...")
-    encoder = VoiceEncoder()
-    
-    # 音声ファイルを読み込み・前処理
-    print(f"音声ファイルを読み込んでいます: {audio_file}")
-    wav = preprocess_wav(audio_file)
-    
-    # セグメント分割のパラメータ
-    segment_duration = 1.5  # 各セグメントの長さ（秒）
-    step_duration = 0.75    # セグメント間のステップ（秒）
-    sample_rate = 16000
-    
-    segment_samples = int(segment_duration * sample_rate)
-    step_samples = int(step_duration * sample_rate)
-    
-    # 音声をセグメントに分割してembeddingを計算
-    print("音声セグメントのembeddingを計算しています...")
-    embeddings = []
-    segment_times = []
-    
-    for start_sample in range(0, len(wav) - segment_samples, step_samples):
-        end_sample = start_sample + segment_samples
-        segment = wav[start_sample:end_sample]
-        
-        # セグメントが短すぎる場合はスキップ
-        if len(segment) < segment_samples * 0.5:
-            continue
-        
-        try:
-            embedding = encoder.embed_utterance(segment)
-            embeddings.append(embedding)
-            start_time = start_sample / sample_rate
-            end_time = end_sample / sample_rate
-            segment_times.append((start_time, end_time))
-        except Exception as e:
-            print(f"セグメント {start_sample} でエラー: {e}")
-            continue
-    
-    if len(embeddings) == 0:
-        print("有効なセグメントが見つかりませんでした")
-        return []
-    
-    embeddings = np.array(embeddings)
-    print(f"計算されたembedding数: {len(embeddings)}")
-    
-    # クラスタリングで話者を分離
-    print("話者クラスタリングを実行しています...")
-    if num_speakers is None:
-        # 話者数を自動推定（2-5人の範囲で最適なクラスタ数を探す）
-        from sklearn.metrics import silhouette_score
-        best_score = -1
-        best_n = 2
-        for n in range(2, min(6, len(embeddings))):
-            try:
-                clustering = AgglomerativeClustering(n_clusters=n)
-                labels = clustering.fit_predict(embeddings)
-                score = silhouette_score(embeddings, labels)
-                if score > best_score:
-                    best_score = score
-                    best_n = n
-            except Exception:
-                continue
-        num_speakers = best_n
-    
-    clustering = AgglomerativeClustering(n_clusters=num_speakers)
-    labels = clustering.fit_predict(embeddings)
-    
-    # セグメントと話者ラベルを結合
-    speaker_segments = []
-    for i, (start_time, end_time) in enumerate(segment_times):
-        speaker_id = labels[i]
-        speaker_segments.append((start_time, end_time, speaker_id))
-    
-    # 連続する同じ話者のセグメントをマージ
-    merged_segments = []
-    if speaker_segments:
-        current_start, current_end, current_speaker = speaker_segments[0]
-        for start_time, end_time, speaker_id in speaker_segments[1:]:
-            if speaker_id == current_speaker:
-                current_end = end_time
-            else:
-                merged_segments.append((current_start, current_end, current_speaker))
-                current_start, current_end, current_speaker = start_time, end_time, speaker_id
-        merged_segments.append((current_start, current_end, current_speaker))
-    
-    diarization_end = time.time()
-    print(f"話者分離完了。処理時間: {diarization_end - diarization_start:.2f}秒")
-    print(f"検出されたセグメント数: {len(merged_segments)}")
-    
-    return merged_segments
-
-
-def transcription_with_timestamps(model, data_resampled: array, chunk_size: int, language: str) -> list:
-    """
-    タイムスタンプ付きで文字起こしを行う
-    
-    Returns:
-        セグメントのリスト: [(start_time, end_time, text), ...]
-    """
-    print("タイムスタンプ付き文字起こしを開始します...")
-    all_segments = []
-    
-    for chunk_idx, i in enumerate(range(0, len(data_resampled), chunk_size)):
-        chunk = data_resampled[i:i + chunk_size]
-        chunk_start_time = i / 16000  # 16kHzサンプルレート
-        
-        try:
-            result = model.transcribe(
-                chunk,
-                verbose=False,
-                language=language,
-                fp16=True,
-                without_timestamps=False  # タイムスタンプを有効化
-            )
-            
-            for segment in result.get('segments', []):
-                start = chunk_start_time + segment['start']
-                end = chunk_start_time + segment['end']
-                text = segment['text'].strip()
-                if text:
-                    all_segments.append((start, end, text))
-            
-            print(f"チャンク {chunk_idx + 1} の文字起こしが完了しました。")
-        except Exception as e:
-            print(f"チャンク {chunk_idx + 1} の文字起こし中にエラーが発生しました: {e}")
-            continue
-    
-    return all_segments
-
-
-def align_transcription_with_speakers(transcription_segments: list, speaker_segments: list) -> list:
-    """
-    文字起こしセグメントと話者セグメントを時間で照合する
-    
-    Args:
-        transcription_segments: [(start, end, text), ...]
-        speaker_segments: [(start, end, speaker_id), ...]
-    
-    Returns:
-        話者付きセグメント: [(start, end, speaker_id, text), ...]
-    """
-    print("文字起こしと話者情報を照合しています...")
-    aligned_segments = []
-    
-    for trans_start, trans_end, text in transcription_segments:
-        trans_mid = (trans_start + trans_end) / 2
-        
-        # 最も重複が大きい話者セグメントを見つける
-        best_speaker = 0
-        best_overlap = 0
-        
-        for spk_start, spk_end, speaker_id in speaker_segments:
-            # 重複区間を計算
-            overlap_start = max(trans_start, spk_start)
-            overlap_end = min(trans_end, spk_end)
-            overlap = max(0, overlap_end - overlap_start)
-            
-            if overlap > best_overlap:
-                best_overlap = overlap
-                best_speaker = speaker_id
-        
-        aligned_segments.append((trans_start, trans_end, best_speaker, text))
-    
-    return aligned_segments
-
-
-def export_diarized_transcription(aligned_segments: list, output_path: str) -> bool:
-    """
-    話者分離された文字起こし結果をファイルに出力する
-    """
-    print(f"話者分離結果を {output_path} に保存しています...")
-    
-    try:
-        with open(output_path, "w", encoding="utf-8") as f:
-            current_speaker = None
-            for start, end, speaker_id, text in aligned_segments:
-                if speaker_id != current_speaker:
-                    if current_speaker is not None:
-                        f.write("\n")
-                    f.write(f"SPEAKER_{speaker_id}:\n")
-                    current_speaker = speaker_id
-                f.write(f"{text}\n")
-        
-        print(f"話者分離結果が {output_path} に保存されました。")
-        return True
-    except Exception as e:
-        print(f"ファイル出力中にエラーが発生しました: {e}")
-        return False
 
 
 def add_punctuation_mark_word_boundary(input_path: str) -> str:
@@ -493,8 +509,12 @@ def summarize_with_gemini(text: str, num_sections: int = 5) -> str:
     """
     import google.generativeai as genai
     
-    # APIキーを環境変数から取得（設定されていない場合はデフォルト値を使用）
-    api_key = os.environ.get("GEMINI_API_KEY", "AIzaSyDCcm6vkvcTeq8DU4cLvgS6yGC4nED9SbM")
+    # APIキーを環境変数から取得（必須。コードに直接書かない）
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "GEMINI_API_KEY が設定されていません。環境変数 GEMINI_API_KEY に Gemini の API キーを設定してください。"
+        )
     genai.configure(api_key=api_key)
     
     # Gemini 2.5 Flashモデルを使用（高速で高品質）
@@ -592,27 +612,22 @@ if is_do_download_whisper:
     else:
         model = load_whisper_result[1]
 
+# DynamoDB に実行ログを作成
+execute_log_id = create_dynamodb_execute_log(
+    execution_env=execution_env,
+    channel=channel,
+    record_date=record_date,
+    video_url=video_url,
+    no=no,
+)
+
 print(f"is_do_output_to_text: {is_do_output_to_text}")
 if is_do_output_to_text:
-    # オーディオファイルを読み込む
-    convert_audio_result = convert_audio_to_monoral(audio_file, model)
-    if not convert_audio_result:
-        raise RuntimeError("オーディオの変換に失敗しました")
-    else:
-        data_resampled = convert_audio_result[1]
-
-    # チャンクサイズを設定（例: 60秒ごとに分割）
-    chunk_size = 60 * 16000  # 60秒 * 16kHz
-
-    # テキストファイルの保存先ディレクトリ
-    os.makedirs(download_dir, exist_ok=True)
-
-    # 既存のファイルがあれば削除
-    if os.path.exists(output_path):
-        os.remove(output_path)
-
-    # 文字起こし開始
-    result: bool = transcription(model, output_path, data_resampled, chunk_size, 'ja')
+    # 通常の文字起こしフロー（関数に分離）
+    result: bool = run_output_to_text(audio_file, model, download_dir, output_path)
+    # run_speaker_diarization_flow で再利用できるように data_resampled を保持しておく
+    # ただし run_output_to_text 内部ではローカル変数なので、ここで再読み込みする場合は
+    # 別途処理が必要（現状は話者分離側でも必要に応じて再読み込みしている）
 
 # 句読点を入れる
 print(f"is_do_output_punctuation: {is_do_output_punctuation}")
@@ -625,40 +640,15 @@ if is_do_output_punctuation:
 # 話者分離を行う
 print(f"is_do_speaker_diarization: {is_do_speaker_diarization}")
 if is_do_speaker_diarization:
-    output_diarization_path: str = os.path.join(download_dir, "diarization.txt")
-    if os.path.exists(output_diarization_path):
-        os.remove(output_diarization_path)
-    
-    # オーディオファイルを読み込む（まだ読み込んでいない場合）
-    if 'data_resampled' not in dir():
-        convert_audio_result = convert_audio_to_monoral(audio_file, model)
-        if not convert_audio_result[0]:
-            raise RuntimeError("オーディオの変換に失敗しました")
-        data_resampled = convert_audio_result[1]
-    
-    # Whisperモデルをロード（まだロードしていない場合）
-    if model is None:
-        load_whisper_result = load_wisper_model()
-        if not load_whisper_result[0]:
-            raise RuntimeError(f"Whisperモデルのロード中にエラーが発生しました: {load_whisper_result[1]}")
-        model = load_whisper_result[1]
-    
-    # チャンクサイズを設定
-    chunk_size = 60 * 16000  # 60秒 * 16kHz
-    
-    # 話者分離を実行
-    print("話者分離処理を開始します...")
-    speaker_segments = perform_speaker_diarization(audio_file)
-    
-    # タイムスタンプ付き文字起こしを実行
-    transcription_segments = transcription_with_timestamps(model, data_resampled, chunk_size, 'ja')
-    
-    # 文字起こしと話者情報を照合
-    aligned_segments = align_transcription_with_speakers(transcription_segments, speaker_segments)
-    
-    # 結果を出力
-    result: bool = export_diarized_transcription(aligned_segments, output_diarization_path)
-    print(f"話者分離付き文字起こし結果が {output_diarization_path} に保存されました。")
+    # 話者分離フロー（関数に分離）
+    # data_resampled は現状このスコープにはないので None を渡し、
+    # 関数側で必要に応じて再サンプリングする
+    result: bool = run_speaker_diarization_flow(
+        audio_file=audio_file,
+        model=model,
+        download_dir=download_dir,
+        data_resampled=None,
+    )
 
 # 要約を生成する
 print(f"is_do_summarization: {is_do_summarization}")
@@ -677,3 +667,22 @@ if is_do_summarization:
         result: bool = export_summary(summary_input_path, output_summary_path, num_sections=5)
     else:
         print(f"要約の入力ファイルが見つかりません: {summary_input_path}")
+
+# 生成されたテキストファイルを S3 にアップロードしてローカルから削除
+print(f"is_do_uploads: {is_do_uploads}")
+if is_do_uploads:
+    result: bool = upload_txt_files_to_s3(
+        download_dir=download_dir,
+        execution_env=execution_env,
+        channel=channel,
+        record_date=record_date,
+        no=no,
+    )
+
+    if result:
+        # DynamoDB の実行ログを更新（終了時刻と結果 True）
+        update_dynamodb_execute_log_result(
+            execution_env=execution_env,
+            log_id=execute_log_id,
+            success=True,
+        )
